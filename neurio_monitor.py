@@ -11,6 +11,11 @@ from datetime import datetime, timedelta, date
 
 import requests
 from flask import Flask, jsonify, request, Response
+from enhanced_appliance_detection import (
+    ApplianceDetector,
+    ApplianceTrainer,
+    init_enhanced_appliance_db,
+)
 
 # ------------- Config -------------
 
@@ -67,6 +72,9 @@ current_event_count = 0
 current_event_sig_avg = 0.0
 
 state_lock = threading.Lock()
+# Enhanced detection engine
+enhanced_detector = None
+enhanced_trainer = None
 
 # Anomaly detection state
 anomaly_state = {
@@ -3124,3 +3132,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
