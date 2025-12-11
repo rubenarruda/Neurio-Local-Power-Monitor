@@ -3124,7 +3124,14 @@ DASHBOARD_HTML = r"""
 # ------------- Main -------------
 
 def main():
+    global enhanced_detector, enhanced_trainer
+
     init_db()
+
+    # Create enhanced detection + training objects
+    enhanced_detector = ApplianceDetector(DB_PATH)
+    enhanced_trainer = ApplianceTrainer(DB_PATH)
+
     t = threading.Thread(target=poll_sensor_loop, daemon=True)
     t.start()
     app.run(host="0.0.0.0", port=8000)
@@ -3132,4 +3139,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
