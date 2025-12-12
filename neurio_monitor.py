@@ -59,6 +59,10 @@ DEFAULT_RATES = {
 DAILY_BUDGET_DEFAULT = 5.00  # not heavily used here, but kept for future
 
 app = Flask(__name__)
+@app.route("/favicon.ico")
+def favicon():
+    return ("", 204)
+
 
 # ----------------- In-memory state -----------------
 
@@ -2759,6 +2763,7 @@ if __name__ == "__main__":
     t.start()
 
     app.run(host="0.0.0.0", port=8000, debug=False)
+
 
 
 
