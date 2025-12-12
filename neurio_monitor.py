@@ -2748,18 +2748,18 @@ DASHBOARD_HTML = r"""
 
 # ----------------- Main -----------------
 
-def main():
-    global enhanced_detector
+if __name__ == "__main__":
+    print("Starting Neurio Power Monitor...")
+
     init_db()
+
     enhanced_detector = ApplianceDetector(DB_PATH)
 
     t = threading.Thread(target=poll_sensor_loop, daemon=True)
     t.start()
 
-    app.run(host="0.0.0.0", port=8000)
+    app.run(host="0.0.0.0", port=8000, debug=False)
 
 
-if __name__ == "__main__":
-    main()
 
 
