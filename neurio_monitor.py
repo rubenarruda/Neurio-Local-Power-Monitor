@@ -1,160 +1,156 @@
 #!/usr/bin/env python3
+"""
+Neurio power monitor + smart analytics + enhanced appliance detection
+Single-file version.
+
+Features:
+- Poll Neurio every second
+- Aggregate into 2-minute energy blocks with TOU cost
+- Enhanced appliance detection (multi-feature matching)
+- Appliance event logging with cost
+- Monthly bill prediction, goal tracking
+- Appliance cost breakdown
+- Peak demand warning
+- Vacation mode pattern check
+- Carbon footprint & tomorrow forecast
+- Anomaly detection for high baseline
+- Insights table (TOU savings, anomalies)
+- Simple JSON API for frontend dashboard
+"""
+
 import os
-import sqlite3
-import threading
 import time
+import threading
 import json
-import io
-import csv
+import sqlite3
 from collections import deque, defaultdict
 from datetime import datetime, timedelta, date
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional, List, Dict, Tuple
 
 import requests
-from flask import Flask, jsonify, request, Response
-from enhanced_appliance_detection import (
-    ApplianceDetector,
-    ApplianceTrainer,
-    init_enhanced_appliance_db,
-)
+from flask import Flask, jsonify, request
 
-# ------------- Config -------------
+# ----------------- Config -----------------
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "neurio_power.sqlite3")
+NEURIO_URL = os.getenv("NEURIO_URL", "http://192.168.50.165/current-sample")
+DB_PATH = os.getenv("NEURIO_DB_PATH", "/home/rarruda/neurio_power.db")
 
-SENSOR_URL = "http://192.168.50.165/current-sample"
-
-POLL_INTERVAL_SECONDS = 1          # sample every second
+POLL_INTERVAL_SECONDS = 1.0        # poll Neurio every 1 second
 AGGREGATE_INTERVAL_SECONDS = 120   # aggregate every 2 minutes
-LIVE_WINDOW_SECONDS = 15 * 60      # keep 15 minutes of live data in RAM
-RETENTION_DAYS = 365               # keep 12 months of history
+LIVE_WINDOW_SECONDS = 15 * 60      # keep 15 minutes of live data
+RETENTION_DAYS = 365               # auto prune > 12 months
 
-DAILY_BUDGET_DEFAULT = 5.00        # default daily budget in dollars
-
-# Default TOU rates in cents per kWh (storage)
+# TOU rates in dollars per kWh
 DEFAULT_RATES = {
     "winter": {
-        "off_peak": 9.8,
-        "mid_peak": 15.7,
-        "on_peak": 20.3,
+        "off_peak": 0.098,
+        "mid_peak": 0.157,
+        "on_peak": 0.203,
     },
     "summer": {
-        "off_peak": 9.8,
-        "mid_peak": 15.7,
-        "on_peak": 20.3,
+        "off_peak": 0.098,
+        "mid_peak": 0.157,
+        "on_peak": 0.203,
     },
 }
+
+DAILY_BUDGET_DEFAULT = 5.00  # not heavily used here, but kept for future
 
 app = Flask(__name__)
 
-# ------------- In-memory state -------------
+# ----------------- In-memory state -----------------
 
-recent_samples = deque(maxlen=LIVE_WINDOW_SECONDS)  # (ts, power_w)
-agg_buffer = []
-last_agg_ts = None
+recent_samples: deque[Tuple[float, Optional[float]]] = deque(
+    maxlen=LIVE_WINDOW_SECONDS
+)  # (ts, power_w)
 
-# TOU rates cache: (season, tou_period) -> rate_cents
-RATES = {}
+agg_buffer: List[Tuple[float, Optional[float]]] = []
+last_agg_ts: Optional[float] = None
 
-# Settings cache
+# TOU rates cache
+RATES: Dict[str, Dict[str, float]] = DEFAULT_RATES.copy()
+
+# Settings cache (very light usage here)
 DAILY_BUDGET = DAILY_BUDGET_DEFAULT
 
-# Appliance learning / detection state
-training_active = False
-training_name = None
-training_samples = []  # list of (ts, power_w)
-appliance_signatures_cache = []  # list of dicts
-
-current_event_name = None
-current_event_start_ts = None
-current_event_sum_delta = 0.0
-current_event_count = 0
-current_event_sig_avg = 0.0
-
-state_lock = threading.Lock()
 # Enhanced detection engine
-enhanced_detector = None
-enhanced_trainer = None
+enhanced_detector = None  # ApplianceDetector instance (set in main)
 
-# Anomaly detection state
+# Anomaly / discovery state
 anomaly_state = {
     "recent_events": deque(maxlen=100),
-    "last_check": 0,
+    "last_check": 0.0,
     "alerts": [],
 }
 
-# Auto-discovery state
 discovery_state = {
     "active": False,
     "start_ts": None,
     "discovered": [],
 }
 
-# ------------- Database helpers -------------
+state_lock = threading.Lock()
 
-def get_db_connection():
+
+# ----------------- DB helpers -----------------
+
+def get_db_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
-
-
-def get_conn():
-    return get_db_connection()
 
 
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # Main samples table
+    # Aggregated samples
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS samples (
-            ts INTEGER PRIMARY KEY,
+            ts REAL PRIMARY KEY,
             power_w REAL NOT NULL,
             energy_kwh REAL NOT NULL,
             cost REAL NOT NULL,
             season TEXT NOT NULL,
             tou_period TEXT NOT NULL,
-            rate_cents REAL NOT NULL
+            rate REAL NOT NULL
         )
         """
     )
 
-    # Rates table
+    # Enhanced appliance signatures (v2)
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS rates (
-            season TEXT NOT NULL,
-            tou_period TEXT NOT NULL,
-            rate_cents REAL NOT NULL,
-            PRIMARY KEY (season, tou_period)
-        )
-        """
-    )
-
-    # Appliance signatures
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS appliance_signatures (
+        CREATE TABLE IF NOT EXISTS appliance_signatures_v2 (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             baseline_w REAL NOT NULL,
-            avg_w REAL NOT NULL,
-            peak_w REAL NOT NULL,
-            created_ts INTEGER NOT NULL
+            startup_w REAL NOT NULL,
+            running_w REAL NOT NULL,
+            shutdown_w REAL NOT NULL,
+            std_dev_w REAL NOT NULL,
+            min_duration_s INTEGER NOT NULL,
+            max_duration_s INTEGER NOT NULL,
+            has_startup_spike INTEGER NOT NULL,
+            has_cycling INTEGER NOT NULL,
+            cycle_period_s INTEGER,
+            created_ts INTEGER NOT NULL,
+            sample_count INTEGER NOT NULL
         )
         """
     )
 
-    # Appliance events
+    # Detected appliance events
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS appliance_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             appliance_name TEXT NOT NULL,
-            start_ts INTEGER NOT NULL,
-            end_ts INTEGER NOT NULL,
+            start_ts REAL NOT NULL,
+            end_ts REAL NOT NULL,
             avg_w REAL NOT NULL,
             energy_kwh REAL NOT NULL,
             cost REAL NOT NULL,
@@ -163,7 +159,7 @@ def init_db():
         """
     )
 
-    # Settings
+    # Simple settings store
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS settings (
@@ -188,7 +184,7 @@ def init_db():
         """
     )
 
-    # Smart insights
+    # Smart insights (e.g. TOU savings suggestions)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS insights (
@@ -203,139 +199,52 @@ def init_db():
         """
     )
 
-    # Seed default rates if missing (store in cents)
-    for season, per in DEFAULT_RATES.items():
-        for period, rate in per.items():
-            cur.execute(
-                """
-                INSERT OR IGNORE INTO rates (season, tou_period, rate_cents)
-                VALUES (?, ?, ?)
-                """,
-                (season, period, rate),
-            )
-
-    # Seed default daily budget if missing
-    cur.execute(
-        """
-        INSERT OR IGNORE INTO settings (key, value)
-        VALUES ('daily_budget', ?)
-        """,
-        (str(DAILY_BUDGET_DEFAULT),),
-    )
-
     conn.commit()
     conn.close()
-
-    load_rates()
-    load_settings()
-    load_appliance_signatures()
-
-
-def load_rates():
-    global RATES
-    RATES = {}
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT season, tou_period, rate_cents FROM rates")
-    for row in cur.fetchall():
-        key = (row["season"], row["tou_period"])
-        RATES[key] = float(row["rate_cents"])
-    conn.close()
-
-    for season, per in DEFAULT_RATES.items():
-        for period, rate in per.items():
-            key = (season, period)
-            if key not in RATES:
-                RATES[key] = rate
-
-
-def update_rate(season, tou_period, rate_cents):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO rates (season, tou_period, rate_cents)
-        VALUES (?, ?, ?)
-        ON CONFLICT(season, tou_period)
-        DO UPDATE SET rate_cents = excluded.rate_cents
-        """,
-        (season, tou_period, rate_cents),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_setting(key, default=None):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
-    row = cur.fetchone()
-    conn.close()
-    if row is None:
-        return default
-    return row["value"]
-
-
-def set_setting(key, value):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO settings (key, value)
-        VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        """,
-        (key, value),
-    )
-    conn.commit()
-    conn.close()
-
-
-def load_settings():
-    global DAILY_BUDGET
-    val = get_setting("daily_budget", str(DAILY_BUDGET_DEFAULT))
-    try:
-        DAILY_BUDGET = float(val)
-    except Exception:
-        DAILY_BUDGET = DAILY_BUDGET_DEFAULT
-
-
-def load_appliance_signatures():
-    global appliance_signatures_cache
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT name, baseline_w, avg_w, peak_w, created_ts
-        FROM appliance_signatures
-        ORDER BY created_ts
-        """
-    )
-    rows = cur.fetchall()
-    conn.close()
-    appliance_signatures_cache = [
-        {
-            "name": r["name"],
-            "baseline_w": float(r["baseline_w"]),
-            "avg_w": float(r["avg_w"]),
-            "peak_w": float(r["peak_w"]),
-            "created_ts": int(r["created_ts"]),
-        }
-        for r in rows
-    ]
 
 
 def prune_old_data():
-    cutoff_ts = int(time.time()) - RETENTION_DAYS * 86400
+    cutoff = time.time() - RETENTION_DAYS * 24 * 3600
     conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM samples WHERE ts < ?", (cutoff_ts,))
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
+        conn.execute("DELETE FROM appliance_events WHERE start_ts < ?", (cutoff,))
+        conn.execute("DELETE FROM anomaly_alerts WHERE ts < ?", (cutoff,))
+        conn.execute("DELETE FROM insights WHERE ts < ?", (cutoff,))
+        conn.commit()
+    finally:
+        conn.close()
 
-# ------------- TOU classification -------------
 
-def classify_tou(dt_local):
+def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    conn = get_db_connection()
+    try:
+        cur = conn.execute("SELECT value FROM settings WHERE key=?", (key,))
+        row = cur.fetchone()
+        if row is None:
+            return default
+        return row["value"]
+    finally:
+        conn.close()
+
+
+def set_setting(key: str, value: str):
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ----------------- TOU helpers -----------------
+
+def classify_tou(dt_local: datetime) -> Tuple[str, str]:
+    """Return (season, tou_period) for Ontario-style TOU."""
     month = dt_local.month
     weekday = dt_local.weekday()
     hour = dt_local.hour
@@ -346,557 +255,462 @@ def classify_tou(dt_local):
         season = "summer"
 
     is_weekend = weekday >= 5
+
     if is_weekend:
-        tou_period = "off_peak"
-    else:
-        if season == "winter":
-            if 7 <= hour < 11 or 17 <= hour < 19:
-                tou_period = "on_peak"
-            elif 11 <= hour < 17:
-                tou_period = "mid_peak"
-            else:
-                tou_period = "off_peak"
+        return season, "off_peak"
+
+    if season == "winter":
+        if 7 <= hour < 11 or 17 <= hour < 19:
+            return season, "on_peak"
+        elif 11 <= hour < 17:
+            return season, "mid_peak"
         else:
-            if 11 <= hour < 17:
-                tou_period = "on_peak"
-            elif 7 <= hour < 11 or 17 <= hour < 19:
-                tou_period = "mid_peak"
-            else:
-                tou_period = "off_peak"
-
-    key = (season, tou_period)
-    rate_cents = RATES.get(key, DEFAULT_RATES[season][tou_period])
-    return season, tou_period, rate_cents
-
-
-def get_tou_info(ts):
-    dt_local = datetime.fromtimestamp(ts)
-    season, tou_period, rate_cents = classify_tou(dt_local)
-    return season, tou_period, rate_cents / 100.0
-
-
-def store_aggregate(ts, avg_power_w):
-    if avg_power_w is None:
-        return
-
-    interval_seconds = AGGREGATE_INTERVAL_SECONDS
-    energy_kwh = avg_power_w * interval_seconds / 1000.0 / 3600.0
-
-    dt_local = datetime.fromtimestamp(ts)
-    season, tou_period, rate_cents = classify_tou(dt_local)
-    cost = energy_kwh * rate_cents / 100.0
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT OR REPLACE INTO samples
-            (ts, power_w, energy_kwh, cost, season, tou_period, rate_cents)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (ts, avg_power_w, energy_kwh, cost, season, tou_period, rate_cents),
-    )
-    conn.commit()
-    conn.close()
-
-    prune_old_data()
-
-# ------------- Sensor polling -------------
-
-def read_neurio_power_w():
-    try:
-        resp = requests.get(SENSOR_URL, timeout=2)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception:
-        return None
-
-    power_w = None
-    channels = data.get("channels", [])
-    for ch in channels:
-        if ch.get("type") == "CONSUMPTION":
-            try:
-                power_w = float(ch.get("p_W", 0.0))
-            except Exception:
-                power_w = 0.0
-            break
-
-    if power_w is None and channels:
-        try:
-            power_w = sum(float(ch.get("p_W", 0.0)) for ch in channels)
-        except Exception:
-            power_w = 0.0
-
-    return power_w
-
-
-def estimate_baseline_from_recent_locked():
-    powers = [p for _, p in recent_samples if p is not None]
-    if not powers:
-        return 0.0
-    powers_sorted = sorted(powers)
-    idx = max(0, int(len(powers_sorted) * 0.1) - 1)
-    return powers_sorted[idx]
-
-
-def store_appliance_event_locked(name, start_ts, end_ts,
-                                 avg_delta_w, sig_avg_w):
-    if end_ts <= start_ts:
-        return
-
-    duration_seconds = (end_ts - start_ts) + POLL_INTERVAL_SECONDS
-    energy_kwh = avg_delta_w * duration_seconds / 1000.0 / 3600.0
-
-    mid_ts = (start_ts + end_ts) // 2
-    dt_mid = datetime.fromtimestamp(mid_ts)
-    season, tou_period, rate_cents = classify_tou(dt_mid)
-    cost = energy_kwh * rate_cents / 100.0
-
-    if sig_avg_w > 0:
-        confidence = max(
-            0.0,
-            1.0 - abs(avg_delta_w - sig_avg_w) / sig_avg_w
-        )
+            return season, "off_peak"
     else:
-        confidence = 0.0
-
-    anomaly_state["recent_events"].append(
-        {
-            "appliance": name,
-            "start_ts": start_ts,
-            "end_ts": end_ts,
-            "avg_w": avg_delta_w,
-            "energy_kwh": energy_kwh,
-            "cost": cost,
-        }
-    )
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO appliance_events
-            (appliance_name, start_ts, end_ts, avg_w, energy_kwh, cost, confidence)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (name, start_ts, end_ts, avg_delta_w, energy_kwh, cost, confidence),
-    )
-
-    # TOU optimization insight
-    savings = calculate_tou_savings(name, avg_delta_w, duration_seconds)
-    if savings:
-        try:
-            cur.execute(
-                """
-                INSERT INTO insights
-                    (ts, type, message, potential_savings, created_ts)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    time.time(),
-                    "tou_optimization",
-                    (
-                        f"Running {savings['appliance']} now costs ${cost:.2f}. "
-                        f"Wait {savings['hours_until_off_peak']}h for off-peak to save "
-                        f"${savings['savings']:.2f}"
-                    ),
-                    savings["savings"],
-                    time.time(),
-                ),
-            )
-        except Exception:
-            pass
-
-    conn.commit()
-    conn.close()
+        # summer
+        if 11 <= hour < 17:
+            return season, "on_peak"
+        elif 7 <= hour < 11 or 17 <= hour < 19:
+            return season, "mid_peak"
+        else:
+            return season, "off_peak"
 
 
-def close_current_event_locked(ts_now):
-    global current_event_name, current_event_start_ts
-    global current_event_sum_delta, current_event_count, current_event_sig_avg
-
-    if current_event_name is None or current_event_count <= 0:
-        current_event_name = None
-        current_event_start_ts = None
-        current_event_sum_delta = 0.0
-        current_event_count = 0
-        current_event_sig_avg = 0.0
-        return
-
-    min_samples = max(30 // POLL_INTERVAL_SECONDS, 5)
-    if current_event_count >= min_samples:
-        avg_delta = current_event_sum_delta / current_event_count
-        store_appliance_event_locked(
-            current_event_name,
-            current_event_start_ts,
-            ts_now,
-            avg_delta,
-            current_event_sig_avg,
-        )
-
-    current_event_name = None
-    current_event_start_ts = None
-    current_event_sum_delta = 0.0
-    current_event_count = 0
-    current_event_sig_avg = 0.0
+def get_tou_info(ts: float) -> Tuple[str, str, float]:
+    """Return (season, tou_period, rate_dollars_per_kwh)."""
+    dt = datetime.fromtimestamp(ts)
+    season, period = classify_tou(dt)
+    rate = RATES.get(season, {}).get(period, 0.10)
+    return season, period, rate
 
 
-def handle_training_locked(ts_now, power_w):
-    global training_samples
-    if training_active and power_w is not None:
-        training_samples.append((ts_now, power_w))
+# ----------------- Enhanced appliance detection -----------------
+
+class ApplianceState(Enum):
+    IDLE = "idle"
+    STARTING = "starting"
+    RUNNING = "running"
+    STOPPING = "stopping"
 
 
-def handle_detection_locked(ts_now, power_w):
-    global current_event_name, current_event_start_ts
-    global current_event_sum_delta, current_event_count, current_event_sig_avg
+@dataclass
+class ApplianceSignature:
+    id: int
+    name: str
 
-    if not appliance_signatures_cache or power_w is None:
-        close_current_event_locked(ts_now)
-        return
+    baseline_w: float
+    startup_w: float
+    running_w: float
+    shutdown_w: float
 
-    baseline = estimate_baseline_from_recent_locked()
-    delta = max(0.0, power_w - baseline)
+    std_dev_w: float
+    min_duration_s: int
+    max_duration_s: int
 
-    best_name = None
-    best_sig_avg = 0.0
-    best_score = 0.0
+    has_startup_spike: bool
+    has_cycling: bool
+    cycle_period_s: Optional[int]
 
-    for sig in appliance_signatures_cache:
-        sig_delta = sig["avg_w"]
-        if sig_delta <= 0:
-            continue
-        diff = abs(delta - sig_delta)
-        threshold = max(0.3 * sig_delta, 200.0)
-        if diff > threshold:
-            continue
-        score = 1.0 - diff / threshold
-        if score > best_score:
-            best_score = score
-            best_name = sig["name"]
-            best_sig_avg = sig_delta
-
-    matched_name = best_name
-
-    if matched_name is None:
-        close_current_event_locked(ts_now)
-        return
-
-    if current_event_name is None:
-        current_event_name = matched_name
-        current_event_start_ts = ts_now
-        current_event_sum_delta = delta
-        current_event_count = 1
-        current_event_sig_avg = best_sig_avg
-    elif current_event_name == matched_name:
-        current_event_sum_delta += delta
-        current_event_count += 1
-    else:
-        close_current_event_locked(ts_now)
-        current_event_name = matched_name
-        current_event_start_ts = ts_now
-        current_event_sum_delta = delta
-        current_event_count = 1
-        current_event_sig_avg = best_sig_avg
+    created_ts: int
+    sample_count: int
 
 
-def finalize_appliance_training_locked():
-    global training_active, training_name, training_samples
+@dataclass
+class ApplianceEventState:
+    signature: ApplianceSignature
+    state: ApplianceState
+    start_ts: float
+    last_update_ts: float
+    samples: List[float]          # delta power samples
+    peak_w: float
+    avg_w: float
+    confidence_scores: List[float]
 
-    if not training_active or not training_samples:
-        return {"error": "No training samples"}
+    def duration_s(self) -> float:
+        return self.last_update_ts - self.start_ts
 
-    powers = [p for _, p in training_samples if p is not None]
-    if not powers:
-        training_active = False
-        training_name = None
-        training_samples = []
-        return {"error": "No valid power samples"}
+    def avg_confidence(self) -> float:
+        if not self.confidence_scores:
+            return 0.0
+        return sum(self.confidence_scores) / len(self.confidence_scores)
 
-    baseline = min(powers)
-    deltas = [max(0.0, p - baseline) for p in powers]
-    if not deltas:
-        training_active = False
-        training_name = None
-        training_samples = []
-        return {"error": "No positive delta samples"}
 
-    avg_delta = sum(deltas) / len(deltas)
-    peak_delta = max(deltas)
-    created_ts = int(training_samples[0][0])
-    name = training_name or "unnamed"
+class FeatureExtractor:
+    """Feature extraction helpers."""
 
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO appliance_signatures
-            (name, baseline_w, avg_w, peak_w, created_ts)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (name, baseline, avg_delta, peak_delta, created_ts),
-    )
-    conn.commit()
-    conn.close()
+    @staticmethod
+    def baseline_from_samples(samples: List[Tuple[float, float]], percentile: float = 10) -> float:
+        powers = [p for _, p in samples if p is not None]
+        if not powers:
+            return 0.0
+        powers_sorted = sorted(powers)
+        idx = int(len(powers_sorted) * percentile / 100.0)
+        idx = max(0, min(idx, len(powers_sorted) - 1))
+        return float(powers_sorted[idx])
 
-    load_appliance_signatures()
-
-    training_active = False
-    training_name = None
-    training_samples = []
-
-    return {
-        "ok": True,
-        "name": name,
-        "baseline_w": baseline,
-        "avg_delta_w": avg_delta,
-        "peak_delta_w": peak_delta,
-    }
-
-# ------------- Anomalies -------------
-
-def detect_anomalies(conn=None):
-    now_ts = time.time()
-    if now_ts - anomaly_state["last_check"] < 300:
-        return
-
-    anomaly_state["last_check"] = now_ts
-    alerts = []
-
-    today = date.today()
-    yesterday = today - timedelta(days=1)
-    week_ago = today - timedelta(days=7)
-
-    own_conn = False
-    if conn is None:
-        conn = get_conn()
-        own_conn = True
-
-    try:
-        conn.row_factory = sqlite3.Row
-
-        today_start = datetime(today.year, today.month, today.day).timestamp()
-        cur = conn.execute(
-            "SELECT AVG(power_w) AS avg FROM samples WHERE ts>=? AND ts<? "
-            "AND CAST(strftime('%H', datetime(ts, 'unixepoch', 'localtime')) AS INTEGER) "
-            "BETWEEN 1 AND 5",
-            (today_start, now_ts),
-        )
-        row = cur.fetchone()
-        today_baseline = row["avg"] if row and row["avg"] is not None else None
-
-        week_start = datetime(week_ago.year, week_ago.month, week_ago.day).timestamp()
-        yesterday_end = datetime(
-            yesterday.year, yesterday.month, yesterday.day
-        ).timestamp()
-        cur = conn.execute(
-            "SELECT AVG(power_w) AS avg FROM samples WHERE ts>=? AND ts<? "
-            "AND CAST(strftime('%H', datetime(ts, 'unixepoch', 'localtime')) AS INTEGER) "
-            "BETWEEN 1 AND 5",
-            (week_start, yesterday_end),
-        )
-        row = cur.fetchone()
-        week_baseline = row["avg"] if row and row["avg"] is not None else None
-
-        if (
-            today_baseline is not None
-            and week_baseline is not None
-            and today_baseline > week_baseline * 1.3
-        ):
-            alert = {
-                "type": "high_baseline",
-                "message": (
-                    f"Always-on power is {int(today_baseline - week_baseline)}W higher than usual. "
-                    f"Check for devices left on."
-                ),
-                "severity": "warning",
+    @staticmethod
+    def analyze_power_profile(samples: List[Tuple[float, float]], baseline: float) -> Dict:
+        powers = [max(0.0, p - baseline) for _, p in samples if p is not None]
+        if not powers:
+            return {
+                "mean": 0.0,
+                "std": 0.0,
+                "min": 0.0,
+                "max": 0.0,
+                "startup_spike": 0.0,
+                "has_cycling": False,
+                "cycle_period": None,
             }
-            alerts.append(alert)
 
-        for alert in alerts:
-            try:
-                conn.execute(
-                    """
-                    INSERT INTO anomaly_alerts
-                        (ts, type, message, severity, acknowledged, created_ts)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (now_ts, alert["type"], alert["message"], alert["severity"], 0, now_ts),
-                )
-            except Exception:
-                pass
-
-        if alerts:
-            conn.commit()
-
-        anomaly_state["alerts"] = alerts
-    finally:
-        if own_conn:
-            conn.close()
-
-# ------------- Poll loop -------------
-
-def poll_sensor_loop():
-    global last_agg_ts, agg_buffer
-
-    while True:
-        ts_now = int(time.time())
-        power_w = read_neurio_power_w()
-
-        with state_lock:
-            recent_samples.append((ts_now, power_w))
-
-            handle_training_locked(ts_now, power_w)
-            handle_detection_locked(ts_now, power_w)
-
-            if power_w is not None:
-                agg_buffer.append((ts_now, power_w))
-
-            if last_agg_ts is None:
-                last_agg_ts = ts_now
-
-            if ts_now - last_agg_ts >= AGGREGATE_INTERVAL_SECONDS and agg_buffer:
-                powers = [p for _, p in agg_buffer if p is not None]
-                if powers:
-                    avg_power = sum(powers) / len(powers)
-                    mid_index = len(agg_buffer) // 2
-                    agg_ts = agg_buffer[mid_index][0]
-                    store_aggregate(agg_ts, avg_power)
-                agg_buffer = []
-                last_agg_ts = ts_now
-
-        try:
-            detect_anomalies()
-        except Exception:
-            pass
-
-        time.sleep(POLL_INTERVAL_SECONDS)
-
-# ------------- Analytics helpers -------------
-
-def get_day_bounds(day_str):
-    if day_str:
-        dt_day = datetime.strptime(day_str, "%Y-%m-%d").date()
-    else:
-        dt_day = date.today()
-    start_dt = datetime(dt_day.year, dt_day.month, dt_day.day)
-    end_dt = start_dt + timedelta(days=1)
-    return dt_day, int(start_dt.timestamp()), int(end_dt.timestamp())
-
-
-def compute_daily_summary(rows, day_start_ts):
-    if not rows:
-        return {
-            "day_str": datetime.fromtimestamp(day_start_ts).strftime("%Y-%m-%d"),
-            "total_kwh": 0.0,
-            "total_cost": 0.0,
-            "max_kw": 0.0,
-            "min_w": 0.0,
-            "always_on_w": 0.0,
-            "avg_kw": 0.0,
-            "load_factor": 0.0,
-        }
-
-    powers = [float(r["power_w"]) for r in rows if r["power_w"] is not None]
-    energies = [float(r["energy_kwh"]) for r in rows]
-    costs = [float(r["cost"]) for r in rows]
-
-    total_kwh = sum(energies)
-    total_cost = sum(costs)
-
-    if powers:
+        n = len(powers)
+        mean_w = sum(powers) / n
+        var = sum((x - mean_w) ** 2 for x in powers) / n
+        std_w = var ** 0.5
         min_w = min(powers)
         max_w = max(powers)
-        sorted_p = sorted(powers)
-        idx = max(0, int(len(sorted_p) * 0.1) - 1)
-        always_on_w = sorted_p[idx]
-    else:
-        min_w = 0.0
-        max_w = 0.0
-        always_on_w = 0.0
 
-    avg_kw = total_kwh / 24.0 if total_kwh > 0 else 0.0
-    max_kw = max_w / 1000.0 if max_w > 0 else 0.0
-    load_factor = (avg_kw / max_kw) if max_kw > 0 else 0.0
+        # Startup spike: first 10% vs rest
+        split = max(1, n // 10)
+        startup = powers[:split]
+        steady = powers[split:] or powers
+        startup_mean = sum(startup) / len(startup)
+        steady_mean = sum(steady) / len(steady)
+        startup_spike = startup_mean - steady_mean if startup_mean > steady_mean * 1.3 else 0.0
 
-    return {
-        "day_str": datetime.fromtimestamp(day_start_ts).strftime("%Y-%m-%d"),
-        "total_kwh": total_kwh,
-        "total_cost": total_cost,
-        "max_kw": max_kw,
-        "min_w": min_w,
-        "always_on_w": always_on_w,
-        "avg_kw": avg_kw,
-        "load_factor": load_factor,
-    }
+        # Very simple cycling heuristic (variance)
+        has_cycling = std_w > max(10.0, mean_w * 0.1)
+        cycle_period = 60 if has_cycling else None
 
-
-def get_daily_summary_for_date(dt_day):
-    start_dt = datetime(dt_day.year, dt_day.month, dt_day.day)
-    end_dt = start_dt + timedelta(days=1)
-    start_ts = int(start_dt.timestamp())
-    end_ts = int(end_dt.timestamp())
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT ts, power_w, energy_kwh, cost, season, tou_period, rate_cents
-        FROM samples
-        WHERE ts >= ? AND ts < ?
-        ORDER BY ts
-        """,
-        (start_ts, end_ts),
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return compute_daily_summary(rows, start_ts)
+        return {
+            "mean": mean_w,
+            "std": std_w,
+            "min": min_w,
+            "max": max_w,
+            "startup_spike": startup_spike,
+            "has_cycling": has_cycling,
+            "cycle_period": cycle_period,
+        }
 
 
-def query_range_totals(start_dt, end_dt):
-    start_ts = int(start_dt.timestamp())
-    end_ts = int(end_dt.timestamp())
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT SUM(energy_kwh) AS kwh, SUM(cost) AS cost FROM samples WHERE ts >= ? AND ts < ?",
-        (start_ts, end_ts),
-    )
-    row = cur.fetchone()
-    conn.close()
-    kwh = row[0] if row and row[0] is not None else 0.0
-    cost = row[1] if row and row[1] is not None else 0.0
-    return kwh, cost
+class ApplianceDetector:
+    """Multi-feature appliance detector."""
 
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.signatures: List[ApplianceSignature] = []
+        self.active_events: Dict[int, ApplianceEventState] = {}
+        self.feature_extractor = FeatureExtractor()
+
+        self.min_power_threshold = 30.0
+        self.startup_window_samples = 5
+        self.confidence_threshold = 0.6
+        self.debounce_seconds = 3.0
+
+        self.recent_samples: deque[Tuple[float, float]] = deque(maxlen=900)
+        self.baseline_cache = 0.0
+        self.baseline_counter = 0
+
+        self.load_signatures()
+
+    def _conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def load_signatures(self):
+        self.signatures.clear()
+        conn = self._conn()
+        try:
+            cur = conn.execute("SELECT * FROM appliance_signatures_v2 ORDER BY created_ts DESC")
+            for row in cur:
+                self.signatures.append(
+                    ApplianceSignature(
+                        id=row["id"],
+                        name=row["name"],
+                        baseline_w=row["baseline_w"],
+                        startup_w=row["startup_w"],
+                        running_w=row["running_w"],
+                        shutdown_w=row["shutdown_w"],
+                        std_dev_w=row["std_dev_w"],
+                        min_duration_s=row["min_duration_s"],
+                        max_duration_s=row["max_duration_s"],
+                        has_startup_spike=bool(row["has_startup_spike"]),
+                        has_cycling=bool(row["has_cycling"]),
+                        cycle_period_s=row["cycle_period_s"],
+                        created_ts=row["created_ts"],
+                        sample_count=row["sample_count"],
+                    )
+                )
+        finally:
+            conn.close()
+
+    def update_baseline(self):
+        self.baseline_counter += 1
+        if self.baseline_counter < 60:
+            return
+        self.baseline_counter = 0
+        if len(self.recent_samples) < 10:
+            return
+        self.baseline_cache = self.feature_extractor.baseline_from_samples(
+            list(self.recent_samples), percentile=15
+        )
+
+    def compute_match_score(
+        self,
+        current_w: float,
+        baseline: float,
+        signature: ApplianceSignature,
+        recent_deltas: List[float],
+    ) -> float:
+        delta = current_w - baseline
+        if delta < self.min_power_threshold:
+            return 0.0
+
+        scores = []
+        # Power level (40%)
+        expected = signature.running_w
+        diff = abs(delta - expected)
+        threshold = max(expected * 0.35, 100.0)
+        if diff > threshold:
+            return 0.0
+        power_score = 1.0 - diff / threshold
+        scores.append((power_score, 0.4))
+
+        # Variance (20%)
+        if len(recent_deltas) >= 5:
+            mean = sum(recent_deltas) / len(recent_deltas)
+            var = sum((x - mean) ** 2 for x in recent_deltas) / len(recent_deltas)
+            std = var ** 0.5
+            if signature.std_dev_w > 0:
+                ratio = min(std, signature.std_dev_w) / max(std, signature.std_dev_w)
+                scores.append((ratio, 0.2))
+
+        # Startup spike (20%)
+        if signature.has_startup_spike and len(recent_deltas) >= self.startup_window_samples:
+            recent_max = max(recent_deltas[-self.startup_window_samples:])
+            if recent_max > signature.startup_w * 0.8:
+                scores.append((1.0, 0.2))
+            else:
+                scores.append((0.5, 0.2))
+        else:
+            scores.append((1.0, 0.2))
+
+        # Duration feasibility (20%) – we accept, refine on stop
+        scores.append((1.0, 0.2))
+
+        return sum(s * w for s, w in scores)
+
+    def process_sample(self, ts: float, power_w: Optional[float]) -> List[Dict]:
+        if power_w is None:
+            return []
+
+        self.recent_samples.append((ts, power_w))
+        self.update_baseline()
+
+        baseline = self.baseline_cache
+        delta = power_w - baseline
+        recent_deltas = [p - baseline for _, p in list(self.recent_samples)[-10:] if p is not None]
+
+        best_id = None
+        best_score = 0.0
+        best_sig = None
+
+        for sig in self.signatures:
+            score = self.compute_match_score(power_w, baseline, sig, recent_deltas)
+            if score > best_score and score >= self.confidence_threshold:
+                best_id = sig.id
+                best_score = score
+                best_sig = sig
+
+        events: List[Dict] = []
+
+        if best_id is not None and best_sig is not None:
+            event = self.active_events.get(best_id)
+            if event is None:
+                # start new
+                event = ApplianceEventState(
+                    signature=best_sig,
+                    state=ApplianceState.STARTING,
+                    start_ts=ts,
+                    last_update_ts=ts,
+                    samples=[delta],
+                    peak_w=delta,
+                    avg_w=delta,
+                    confidence_scores=[best_score],
+                )
+                self.active_events[best_id] = event
+                events.append(
+                    {
+                        "type": "started",
+                        "signature_id": best_id,
+                        "appliance": best_sig.name,
+                        "start_ts": ts,
+                        "initial_w": delta,
+                        "confidence": best_score,
+                    }
+                )
+            else:
+                event.last_update_ts = ts
+                event.samples.append(delta)
+                event.peak_w = max(event.peak_w, delta)
+                event.avg_w = sum(event.samples) / len(event.samples)
+                event.confidence_scores.append(best_score)
+
+                # trim
+                if len(event.samples) > 100:
+                    event.samples = event.samples[-100:]
+                    event.confidence_scores = event.confidence_scores[-100:]
+
+                events.append(
+                    {
+                        "type": "updated",
+                        "signature_id": best_id,
+                        "appliance": best_sig.name,
+                        "duration_s": event.duration_s(),
+                        "avg_w": event.avg_w,
+                        "confidence": event.avg_confidence(),
+                    }
+                )
+
+        # Check for events that should be closed
+        to_remove = []
+        for sig_id, event in list(self.active_events.items()):
+            # If not the best match this second, see if it's timed out
+            if sig_id != best_id:
+                idle_for = ts - event.last_update_ts
+                if idle_for >= self.debounce_seconds:
+                    duration = event.duration_s()
+                    if duration >= event.signature.min_duration_s:
+                        events.append(
+                            {
+                                "type": "stopped",
+                                "signature_id": sig_id,
+                                "appliance": event.signature.name,
+                                "start_ts": event.start_ts,
+                                "end_ts": ts,
+                                "duration_s": duration,
+                                "avg_w": event.avg_w,
+                                "peak_w": event.peak_w,
+                                "confidence": event.avg_confidence(),
+                            }
+                        )
+                    to_remove.append(sig_id)
+
+        for sig_id in to_remove:
+            self.active_events.pop(sig_id, None)
+
+        return events
+
+
+class ApplianceTrainer:
+    """Training helper for enhanced signatures."""
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.extractor = FeatureExtractor()
+
+    def _conn(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def train_from_samples(self, name: str, samples: List[Tuple[float, float]]) -> Optional[ApplianceSignature]:
+        if len(samples) < 30:
+            return None
+
+        baseline = self.extractor.baseline_from_samples(samples)
+        profile = self.extractor.analyze_power_profile(samples, baseline)
+        mean = profile["mean"]
+        if mean < 30:
+            return None
+
+        duration = samples[-1][0] - samples[0][0]
+        min_duration = max(30, int(duration * 0.5))
+        max_duration = int(duration * 3)
+
+        sig = ApplianceSignature(
+            id=0,
+            name=name,
+            baseline_w=baseline,
+            startup_w=profile["max"],
+            running_w=mean,
+            shutdown_w=0.0,
+            std_dev_w=profile["std"],
+            min_duration_s=min_duration,
+            max_duration_s=max_duration,
+            has_startup_spike=profile["startup_spike"] > mean * 0.2,
+            has_cycling=profile["has_cycling"],
+            cycle_period_s=profile["cycle_period"],
+            created_ts=int(time.time()),
+            sample_count=len(samples),
+        )
+
+        conn = self._conn()
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO appliance_signatures_v2
+                (name, baseline_w, startup_w, running_w, shutdown_w, std_dev_w,
+                 min_duration_s, max_duration_s, has_startup_spike, has_cycling,
+                 cycle_period_s, created_ts, sample_count)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    sig.name,
+                    sig.baseline_w,
+                    sig.startup_w,
+                    sig.running_w,
+                    sig.shutdown_w,
+                    sig.std_dev_w,
+                    sig.min_duration_s,
+                    sig.max_duration_s,
+                    int(sig.has_startup_spike),
+                    int(sig.has_cycling),
+                    sig.cycle_period_s,
+                    sig.created_ts,
+                    sig.sample_count,
+                ),
+            )
+            conn.commit()
+            sig.id = cur.lastrowid
+        finally:
+            conn.close()
+
+        return sig
+
+
+# ----------------- Smart analytics functions -----------------
 
 def predict_monthly_cost():
+    """Predict end-of-month bill from current usage."""
     today = date.today()
-    first_this = date(today.year, today.month, 1)
-    start_ts = datetime(first_this.year, first_this.month, 1).timestamp()
+    first = date(today.year, today.month, 1)
+    start_ts = datetime(first.year, first.month, 1).timestamp()
     now_ts = time.time()
 
-    conn = get_conn()
+    conn = get_db_connection()
     try:
-        conn.row_factory = sqlite3.Row
         cur = conn.execute(
-            "SELECT SUM(cost) AS total FROM samples WHERE ts>=? AND ts<?",
+            "SELECT SUM(cost) as total FROM samples WHERE ts>=? AND ts<?",
             (start_ts, now_ts),
         )
         row = cur.fetchone()
-        spent_so_far = row["total"] if row and row["total"] is not None else 0.0
+        spent = row["total"] or 0.0
     finally:
         conn.close()
 
-    days_elapsed = (today - first_this).days + 1
-    if days_elapsed == 0:
+    days_elapsed = (today - first).days + 1
+    if days_elapsed <= 0:
         return {"predicted_monthly": 0, "spent_so_far": 0, "confidence": "low"}
 
+    # Days in month
     if today.month == 12:
         next_month = date(today.year + 1, 1, 1)
     else:
         next_month = date(today.year, today.month + 1, 1)
-    days_in_month = (next_month - first_this).days
 
-    daily_avg = spent_so_far / days_elapsed
+    days_in_month = (next_month - first).days
+    daily_avg = spent / days_elapsed
     predicted = daily_avg * days_in_month
 
     if days_elapsed > 7:
@@ -908,7 +722,7 @@ def predict_monthly_cost():
 
     return {
         "predicted_monthly": round(predicted, 2),
-        "spent_so_far": round(spent_so_far, 2),
+        "spent_so_far": round(spent, 2),
         "daily_average": round(daily_avg, 2),
         "days_elapsed": days_elapsed,
         "days_in_month": days_in_month,
@@ -916,11 +730,12 @@ def predict_monthly_cost():
     }
 
 
-def calculate_tou_savings(appliance_name, avg_w, duration_s):
-    now_ts = time.time()
-    _, current_period, current_rate = get_tou_info(now_ts)
+def calculate_tou_savings(appliance_name: str, avg_w: float, duration_s: float):
+    """Estimate savings by shifting this run to off-peak."""
+    now = time.time()
+    _, current_period, current_rate = get_tou_info(now)
 
-    dt = datetime.fromtimestamp(now_ts)
+    dt = datetime.fromtimestamp(now)
     off_peak_rate = None
     hours_until = 0
 
@@ -938,8 +753,8 @@ def calculate_tou_savings(appliance_name, avg_w, duration_s):
 
     energy_kwh = (avg_w * duration_s) / (3600.0 * 1000.0)
     current_cost = energy_kwh * current_rate
-    off_peak_cost = energy_kwh * off_peak_rate
-    savings = current_cost - off_peak_cost
+    off_cost = energy_kwh * off_peak_rate
+    savings = current_cost - off_cost
 
     if savings < 0.10:
         return None
@@ -951,25 +766,99 @@ def calculate_tou_savings(appliance_name, avg_w, duration_s):
         "current_period": current_period,
     }
 
-# 1. Appliance Cost Breakdown
 
-def get_appliance_costs_breakdown(days=30):
-    since = time.time() - (days * 24 * 3600)
-    conn = get_conn()
+def detect_anomalies():
+    """Detect high baseline 'always-on' power vs previous week."""
+    now = time.time()
+    if now - anomaly_state["last_check"] < 300:
+        return
+
+    anomaly_state["last_check"] = now
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+    week_ago = today - timedelta(days=7)
+
+    conn = get_db_connection()
     try:
         conn.row_factory = sqlite3.Row
+
+        # Today's baseline between 1–5am
+        today_start = datetime(today.year, today.month, today.day).timestamp()
         cur = conn.execute(
-            "SELECT appliance_name, SUM(cost) AS total_cost, "
-            "SUM(energy_kwh) AS total_kwh, COUNT(*) AS runs "
-            "FROM appliance_events WHERE start_ts>=? "
-            "GROUP BY appliance_name ORDER BY total_cost DESC",
+            """
+            SELECT AVG(power_w) as avg
+            FROM samples
+            WHERE ts>=? AND ts<? AND
+                  CAST(strftime('%H', datetime(ts, 'unixepoch', 'localtime')) AS INTEGER)
+                  BETWEEN 1 AND 5
+            """,
+            (today_start, now),
+        )
+        row = cur.fetchone()
+        today_baseline = row["avg"] if row and row["avg"] is not None else None
+
+        week_start = datetime(week_ago.year, week_ago.month, week_ago.day).timestamp()
+        yesterday_end = datetime(yesterday.year, yesterday.month, yesterday.day).timestamp()
+        cur = conn.execute(
+            """
+            SELECT AVG(power_w) as avg
+            FROM samples
+            WHERE ts>=? AND ts<? AND
+                  CAST(strftime('%H', datetime(ts, 'unixepoch', 'localtime')) AS INTEGER)
+                  BETWEEN 1 AND 5
+            """,
+            (week_start, yesterday_end),
+        )
+        row = cur.fetchone()
+        week_baseline = row["avg"] if row and row["avg"] is not None else None
+
+        alerts = []
+
+        if today_baseline and week_baseline and today_baseline > week_baseline * 1.3:
+            msg = (
+                f"Always-on power is {int(today_baseline - week_baseline)}W higher "
+                f"than usual. Check for devices left on."
+            )
+            alert = {
+                "type": "high_baseline",
+                "message": msg,
+                "severity": "warning",
+            }
+            alerts.append(alert)
+            conn.execute(
+                """
+                INSERT INTO anomaly_alerts(ts, type, message, severity, created_ts)
+                VALUES(?,?,?,?,?)
+                """,
+                (now, alert["type"], alert["message"], alert["severity"], now),
+            )
+            conn.commit()
+
+        anomaly_state["alerts"] = alerts
+    finally:
+        conn.close()
+
+
+def get_appliance_costs_breakdown(days: int = 30):
+    since = time.time() - days * 24 * 3600
+    conn = get_db_connection()
+    try:
+        cur = conn.execute(
+            """
+            SELECT appliance_name, SUM(cost) as total_cost,
+                   SUM(energy_kwh) as total_kwh, COUNT(*) as runs
+            FROM appliance_events
+            WHERE start_ts>=?
+            GROUP BY appliance_name
+            ORDER BY total_cost DESC
+            """,
             (since,),
         )
         return [
             {
                 "name": r["appliance_name"],
-                "cost": r["total_cost"],
-                "kwh": r["total_kwh"],
+                "cost": round(r["total_cost"] or 0.0, 2),
+                "kwh": round(r["total_kwh"] or 0.0, 2),
                 "runs": r["runs"],
             }
             for r in cur
@@ -977,158 +866,159 @@ def get_appliance_costs_breakdown(days=30):
     finally:
         conn.close()
 
-# 2. Weather Correlation placeholder
 
-def get_weather_correlation():
-    return None
-
-# 3. Appliance Health Monitoring
-
-def detect_appliance_degradation(appliance_id):
-    conn = get_conn()
+def detect_appliance_degradation(appliance_name: str):
+    """Check if an appliance is using significantly more kWh over last 30 days."""
+    conn = get_db_connection()
     try:
-        conn.row_factory = sqlite3.Row
+        since = time.time() - 30 * 24 * 3600
         cur = conn.execute(
-            "SELECT energy_kwh, start_ts FROM appliance_events "
-            "WHERE appliance_name=? AND start_ts>=? ORDER BY start_ts",
-            (appliance_id, time.time() - 30 * 24 * 3600),
+            """
+            SELECT energy_kwh, start_ts
+            FROM appliance_events
+            WHERE appliance_name=? AND start_ts>=?
+            ORDER BY start_ts
+            """,
+            (appliance_name, since),
         )
         events = [{"kwh": r["energy_kwh"], "ts": r["start_ts"]} for r in cur]
-
         if len(events) < 5:
             return None
 
         mid = len(events) // 2
-        first_half_avg = sum(e["kwh"] for e in events[:mid]) / mid
-        second_half_avg = sum(e["kwh"] for e in events[mid:]) / (len(events) - mid)
+        first_avg = sum(e["kwh"] for e in events[:mid]) / mid
+        second_avg = sum(e["kwh"] for e in events[mid:]) / (len(events) - mid)
 
-        if second_half_avg > first_half_avg * 1.2:
-            increase_pct = ((second_half_avg - first_half_avg) / first_half_avg) * 100
+        if second_avg > first_avg * 1.2:
+            inc_pct = (second_avg - first_avg) / first_avg * 100.0
             return {
-                "appliance_id": appliance_id,
-                "increase_pct": increase_pct,
-                "message": (
-                    f"Appliance using {int(increase_pct)} percent more energy than before"
-                ),
+                "appliance_name": appliance_name,
+                "increase_pct": round(inc_pct, 1),
+                "message": f"{appliance_name} is using {int(inc_pct)}% more energy than before",
             }
         return None
     finally:
         conn.close()
 
-# 4. Goal Tracking
 
 def track_energy_goal():
-    goal_kwh = float(get_setting("goal_monthly_kwh", "0"))
-    if goal_kwh == 0:
+    """Monthly kWh goal tracking."""
+    goal_str = get_setting("goal_monthly_kwh", "0")
+    try:
+        goal_kwh = float(goal_str)
+    except (TypeError, ValueError):
+        goal_kwh = 0.0
+
+    if goal_kwh <= 0:
         return None
 
     today = date.today()
-    month_start = date(today.year, today.month, 1).timestamp()
+    month_start_dt = date(today.year, today.month, 1)
+    month_start_ts = datetime(month_start_dt.year, month_start_dt.month, month_start_dt.day).timestamp()
 
-    conn = get_conn()
+    conn = get_db_connection()
     try:
-        conn.row_factory = sqlite3.Row
         cur = conn.execute(
-            "SELECT SUM(energy_kwh) AS used FROM samples WHERE ts>=?",
-            (month_start,),
+            "SELECT SUM(energy_kwh) as used FROM samples WHERE ts>=?",
+            (month_start_ts,),
         )
-        row = cur.fetchone()
-        used = row["used"] or 0 if row and row["used"] is not None else 0
-
-        days_elapsed = (today - date(today.year, today.month, 1)).days + 1
-        if today.month == 12:
-            days_in_month = 31
-        else:
-            days_in_month = (
-                date(today.year, today.month + 1, 1)
-                - date(today.year, today.month, 1)
-            ).days
-
-        projected = (used / days_elapsed) * days_in_month if days_elapsed > 0 else used
-        pct_to_goal = (used / goal_kwh) * 100 if goal_kwh > 0 else 0
-
-        return {
-            "goal_kwh": goal_kwh,
-            "used_kwh": round(used, 1),
-            "projected_kwh": round(projected, 1),
-            "pct_to_goal": round(pct_to_goal, 1),
-            "on_track": projected <= goal_kwh,
-        }
+        used = cur.fetchone()["used"] or 0.0
     finally:
         conn.close()
 
-# 5. Peak Demand Predictor
+    days_elapsed = (today - month_start_dt).days + 1
+    if today.month == 12:
+        days_in_month = 31
+    else:
+        days_in_month = (date(today.year, today.month + 1, 1) - month_start_dt).days
+
+    projected = (used / days_elapsed) * days_in_month if days_elapsed > 0 else 0.0
+    pct_to_goal = (used / goal_kwh) * 100.0 if goal_kwh > 0 else 0.0
+
+    return {
+        "goal_kwh": round(goal_kwh, 1),
+        "used_kwh": round(used, 1),
+        "projected_kwh": round(projected, 1),
+        "pct_to_goal": round(pct_to_goal, 1),
+        "on_track": projected <= goal_kwh,
+    }
+
 
 def predict_peak_demand():
+    """Warn if you're close to today's peak."""
     with state_lock:
         if not recent_samples:
             return None
         _, current_w = recent_samples[-1]
-        if current_w is None:
-            return None
+    if current_w is None:
+        return None
 
-    today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-    conn = get_conn()
+    today = date.today()
+    day_start_ts = datetime(today.year, today.month, today.day).timestamp()
+    conn = get_db_connection()
     try:
-        conn.row_factory = sqlite3.Row
         cur = conn.execute(
-            "SELECT MAX(power_w) AS max_today FROM samples WHERE ts>=?",
-            (today_start,),
+            "SELECT MAX(power_w) as max_today FROM samples WHERE ts>=?",
+            (day_start_ts,),
         )
         row = cur.fetchone()
-        max_today = row["max_today"] or 0 if row and row["max_today"] is not None else 0
-
-        if current_w > max_today * 0.9 and max_today > 0:
-            return {
-                "warning": True,
-                "current_w": current_w,
-                "todays_peak": max_today,
-                "message": (
-                    f"You're at {int(current_w)}W, close to today's peak of {int(max_today)}W!"
-                ),
-            }
-        return None
+        max_today = row["max_today"] or 0.0
     finally:
         conn.close()
 
-# 6. Vacation Mode Detection
+    if max_today <= 0:
+        return None
+
+    if current_w > max_today * 0.9:
+        return {
+            "warning": True,
+            "current_w": int(current_w),
+            "todays_peak": int(max_today),
+            "message": f"You're at {int(current_w)}W, close to today's peak of {int(max_today)}W!",
+        }
+    return None
+
 
 def detect_vacation_mode():
-    recent = time.time() - (3 * 24 * 3600)
-    conn = get_conn()
+    """Detect if usage pattern suggests you're away."""
+    now = time.time()
+    recent_start = now - 3 * 24 * 3600
+    month_ago = now - 30 * 24 * 3600
+
+    conn = get_db_connection()
     try:
-        conn.row_factory = sqlite3.Row
+        # Recent avg power
         cur = conn.execute(
-            "SELECT AVG(power_w) AS avg FROM samples WHERE ts>=?",
-            (recent,),
+            "SELECT AVG(power_w) as avg FROM samples WHERE ts>=?",
+            (recent_start,),
         )
-        row = cur.fetchone()
-        recent_avg = row["avg"] or 0 if row and row["avg"] is not None else 0
+        recent_avg = cur.fetchone()["avg"] or 0.0
 
-        month_ago = time.time() - (30 * 24 * 3600)
+        # Baseline at night in last month
         cur = conn.execute(
-            "SELECT AVG(power_w) AS avg FROM samples "
-            "WHERE ts>=? AND ts<? "
-            "AND CAST(strftime('%H', datetime(ts, 'unixepoch', 'localtime')) AS INTEGER) "
-            "BETWEEN 1 AND 5",
-            (month_ago, recent),
+            """
+            SELECT AVG(power_w) as avg FROM samples
+            WHERE ts>=? AND ts<? AND
+                  CAST(strftime('%H', datetime(ts, 'unixepoch', 'localtime')) AS INTEGER)
+                  BETWEEN 1 AND 5
+            """,
+            (month_ago, recent_start),
         )
-        row = cur.fetchone()
-        typical_baseline = row["avg"] or 0 if row and row["avg"] is not None else 0
-
-        if typical_baseline > 0 and recent_avg < typical_baseline * 1.2:
-            return {
-                "likely_away": True,
-                "current_avg": int(recent_avg),
-                "message": "Usage pattern suggests you're away. Baseline power looks normal.",
-            }
-        return None
+        baseline = cur.fetchone()["avg"] or 0.0
     finally:
         conn.close()
 
-# 7. Bill Simulator
+    if baseline > 0 and recent_avg < baseline * 1.2:
+        return {
+            "likely_away": True,
+            "current_avg": int(recent_avg),
+            "message": "Usage pattern suggests you're away. Baseline power looks normal.",
+        }
+    return None
 
-def simulate_different_rate_plan(plan_rates):
+
+def simulate_different_rate_plan(plan_rates: Dict[str, Dict[str, float]]):
+    """Recalculate last month's bill under a different TOU plan."""
     today = date.today()
     if today.month == 1:
         last_month = date(today.year - 1, 12, 1)
@@ -1141,148 +1031,128 @@ def simulate_different_rate_plan(plan_rates):
     else:
         end_ts = datetime(last_month.year, last_month.month + 1, 1).timestamp()
 
-    conn = get_conn()
+    conn = get_db_connection()
     try:
-        conn.row_factory = sqlite3.Row
         cur = conn.execute(
             "SELECT energy_kwh, season, tou_period FROM samples WHERE ts>=? AND ts<?",
             (start_ts, end_ts),
         )
-
         actual_cost = 0.0
         simulated_cost = 0.0
-
         for row in cur:
-            kwh = row["energy_kwh"] or 0
+            kwh = row["energy_kwh"] or 0.0
             season = row["season"]
             period = row["tou_period"]
-
-            actual_rate_cents = RATES.get((season, period), DEFAULT_RATES[season][period])
-            actual_rate = actual_rate_cents / 100.0
-            actual_cost += kwh * actual_rate
-
+            actual_rate = RATES.get(season, {}).get(period, 0.10)
             sim_rate = plan_rates.get(season, {}).get(period, actual_rate)
+            actual_cost += kwh * actual_rate
             simulated_cost += kwh * sim_rate
-
-        difference = simulated_cost - actual_cost
-        savings_pct = (
-            ((actual_cost - simulated_cost) / actual_cost * 100.0)
-            if actual_cost > 0
-            else 0.0
-        )
-
-        return {
-            "actual_cost": round(actual_cost, 2),
-            "simulated_cost": round(simulated_cost, 2),
-            "difference": round(difference, 2),
-            "savings_pct": round(savings_pct, 1),
-        }
     finally:
         conn.close()
 
-# 8. Carbon Footprint Tracker
+    diff = simulated_cost - actual_cost
+    savings_pct = ((actual_cost - simulated_cost) / actual_cost * 100.0) if actual_cost > 0 else 0.0
+
+    return {
+        "actual_cost": round(actual_cost, 2),
+        "simulated_cost": round(simulated_cost, 2),
+        "difference": round(diff, 2),
+        "savings_pct": round(savings_pct, 1),
+    }
+
 
 def calculate_carbon_footprint():
-    ONTARIO_CO2_PER_KWH = 0.040
+    """Convert this month's kWh to CO2 emissions."""
+    ONTARIO_CO2_PER_KWH = 0.040  # kg CO2 per kWh
 
     today = date.today()
-    month_start = date(today.year, today.month, 1).timestamp()
-
-    conn = get_conn()
+    start = datetime(today.year, today.month, 1).timestamp()
+    conn = get_db_connection()
     try:
-        conn.row_factory = sqlite3.Row
         cur = conn.execute(
-            "SELECT SUM(energy_kwh) AS total FROM samples WHERE ts>=?",
-            (month_start,),
+            "SELECT SUM(energy_kwh) as total FROM samples WHERE ts>=?",
+            (start,),
         )
-        row = cur.fetchone()
-        kwh = row["total"] or 0 if row and row["total"] is not None else 0
-
-        co2_kg = kwh * ONTARIO_CO2_PER_KWH
-
-        trees_to_offset = co2_kg / 21.0
-        km_driven = co2_kg / 0.192
-
-        return {
-            "kwh": round(kwh, 1),
-            "co2_kg": round(co2_kg, 1),
-            "trees_equivalent": round(trees_to_offset, 1),
-            "km_driven_equivalent": round(km_driven, 0),
-        }
+        kwh = cur.fetchone()["total"] or 0.0
     finally:
         conn.close()
 
-# 9. Smart Load Forecasting
+    co2_kg = kwh * ONTARIO_CO2_PER_KWH
+    trees = co2_kg / 21.0
+    km_driven = co2_kg / 0.192
+
+    return {
+        "kwh": round(kwh, 1),
+        "co2_kg": round(co2_kg, 1),
+        "trees_equivalent": round(trees, 1),
+        "km_driven_equivalent": round(km_driven, 0),
+    }
+
 
 def forecast_tomorrow():
+    """Predict tomorrow's cost using same weekday over last few weeks."""
     tomorrow = date.today() + timedelta(days=1)
-
-    conn = get_conn()
+    conn = get_db_connection()
+    costs = []
     try:
-        conn.row_factory = sqlite3.Row
-        costs = []
         for weeks_ago in range(1, 5):
             target_date = tomorrow - timedelta(weeks=weeks_ago)
-            start = datetime(
-                target_date.year, target_date.month, target_date.day
-            ).timestamp()
+            start = datetime(target_date.year, target_date.month, target_date.day).timestamp()
             end = start + 24 * 3600
-
             cur = conn.execute(
-                "SELECT SUM(cost) AS total FROM samples WHERE ts>=? AND ts<?",
+                "SELECT SUM(cost) as total FROM samples WHERE ts>=? AND ts<?",
                 (start, end),
             )
-            row = cur.fetchone()
-            cost = row["total"] or 0 if row and row["total"] is not None else 0
-            if cost > 0:
-                costs.append(cost)
-
-        if not costs:
-            return None
-
-        avg_cost = sum(costs) / len(costs)
-
-        return {
-            "predicted_cost": round(avg_cost, 2),
-            "day": tomorrow.strftime("%A"),
-            "confidence": "high" if len(costs) >= 3 else "medium",
-        }
+            total = cur.fetchone()["total"] or 0.0
+            if total > 0:
+                costs.append(total)
     finally:
         conn.close()
 
-# 10. Appliance Auto-Discovery
+    if not costs:
+        return None
+
+    avg_cost = sum(costs) / len(costs)
+    return {
+        "predicted_cost": round(avg_cost, 2),
+        "day": tomorrow.strftime("%A"),
+        "confidence": "high" if len(costs) >= 3 else "medium",
+    }
+
 
 def run_auto_discovery_analysis():
-    if not discovery_state["active"]:
+    """Cluster appliance_events during discovery window."""
+    if not discovery_state["active"] or not discovery_state["start_ts"]:
         return []
 
     start_ts = discovery_state["start_ts"]
-    now_ts = time.time()
-
-    if not start_ts or now_ts - start_ts < 3600:
+    now = time.time()
+    if now - start_ts < 3600:
         return []
 
-    conn = get_conn()
+    conn = get_db_connection()
     try:
-        conn.row_factory = sqlite3.Row
         cur = conn.execute(
-            "SELECT start_ts, end_ts, energy_kwh, cost FROM appliance_events WHERE start_ts>=?",
+            """
+            SELECT start_ts, end_ts, energy_kwh, cost
+            FROM appliance_events
+            WHERE start_ts>=?
+            """,
             (start_ts,),
         )
-
         events = []
         for row in cur:
             duration = row["end_ts"] - row["start_ts"]
             events.append(
                 {
                     "start": row["start_ts"],
-                    "duration_min": int(duration / 60),
+                    "duration_min": int(duration / 60.0),
                     "kwh": row["energy_kwh"],
                     "cost": row["cost"],
                 }
             )
 
-        clusters = defaultdict(list)
+        clusters: Dict[Tuple[int, float], List[Dict]] = defaultdict(list)
         for ev in events:
             key = (round(ev["duration_min"] / 10) * 10, round(ev["kwh"], 1))
             clusters[key].append(ev)
@@ -1299,19 +1169,15 @@ def run_auto_discovery_analysis():
                         "suggested_name": guess_appliance_name(dur, kwh),
                     }
                 )
-
-        discovery_state["discovered"] = suggestions
         return suggestions
     finally:
         conn.close()
 
 
-def guess_appliance_name(duration_min, kwh):
+def guess_appliance_name(duration_min: int, kwh: float) -> str:
     if duration_min <= 0:
-        avg_w = 0
-    else:
-        avg_w = (kwh * 1000.0) / (duration_min / 60.0)
-
+        return "Unknown Appliance"
+    avg_w = (kwh * 1000.0) / (duration_min / 60.0)
     if avg_w > 2000:
         return "EV Charger or Dryer"
     elif avg_w > 1200 and duration_min < 60:
@@ -1323,42 +1189,186 @@ def guess_appliance_name(duration_min, kwh):
     else:
         return "Unknown Appliance"
 
-# 11. Real-time Notifications
 
-def send_notification(title, message, severity="info"):
+def send_notification(title: str, message: str, severity: str = "info"):
     webhook_url = get_setting("webhook_url")
     if not webhook_url:
         return
-
     try:
         requests.post(
             webhook_url,
-            json={
-                "title": title,
-                "message": message,
-                "severity": severity,
-            },
+            json={"title": title, "message": message, "severity": severity},
             timeout=5,
         )
     except Exception:
         pass
 
-# 12. Voice Summary
 
-def get_voice_summary():
+def get_voice_summary() -> str:
     pred = predict_monthly_cost()
     return (
-        f"Your predicted bill this month is ${pred['predicted_monthly']}. "
-        f"You're currently using {pred['daily_average']} dollars per day. "
-        f"You've spent {pred['spent_so_far']} dollars so far this month."
+        f"Your predicted bill this month is ${pred['predicted_monthly']:.2f}. "
+        f"You're currently spending about ${pred['daily_average']:.2f} per day. "
+        f"You've spent ${pred['spent_so_far']:.2f} so far this month."
     )
 
-# ------------- API routes -------------
 
-@app.route("/")
-def index():
-    return DASHBOARD_HTML
+# ----------------- Sensor polling & storage -----------------
 
+def read_neurio_power_w() -> Optional[float]:
+    try:
+        resp = requests.get(NEURIO_URL, timeout=2)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return None
+
+    power_w = None
+    for ch in data.get("channels", []):
+        if ch.get("type") == "CONSUMPTION":
+            try:
+                power_w = float(ch.get("p_W", 0.0))
+            except Exception:
+                power_w = None
+            break
+    return power_w
+
+
+def store_aggregate(ts: float, avg_power_w: float):
+    if avg_power_w is None:
+        return
+
+    interval = AGGREGATE_INTERVAL_SECONDS
+    energy_kwh = avg_power_w * interval / 1000.0 / 3600.0
+    season, period, rate = get_tou_info(ts)
+    cost = energy_kwh * rate
+
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO samples
+            (ts, power_w, energy_kwh, cost, season, tou_period, rate)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (ts, avg_power_w, energy_kwh, cost, season, period, rate),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    prune_old_data()
+    detect_anomalies()
+
+
+def store_detector_event(ev: Dict):
+    """Persist an event from the enhanced detector and create insights."""
+    name = ev["appliance"]
+    start_ts = float(ev["start_ts"])
+    end_ts = float(ev["end_ts"])
+    avg_w = float(ev["avg_w"])
+    duration_s = max(float(ev["duration_s"]), 1.0)
+    confidence = float(ev.get("confidence", 0.0))
+
+    energy_kwh = avg_w * duration_s / 1000.0 / 3600.0
+    mid_ts = (start_ts + end_ts) / 2.0
+    season, period, rate = get_tou_info(mid_ts)
+    cost = energy_kwh * rate
+
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO appliance_events
+            (appliance_name, start_ts, end_ts, avg_w, energy_kwh, cost, confidence)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (name, start_ts, end_ts, avg_w, energy_kwh, cost, confidence),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    anomaly_state["recent_events"].append(
+        {
+            "ts": end_ts,
+            "appliance": name,
+            "avg_w": avg_w,
+            "duration_s": duration_s,
+            "cost": cost,
+            "confidence": confidence,
+        }
+    )
+
+    savings = calculate_tou_savings(name, avg_w, duration_s)
+    if savings:
+        msg = (
+            f"Running {savings['appliance']} now costs ${cost:.2f}. "
+            f"Wait {savings['hours_until_off_peak']}h for off-peak "
+            f"to save about ${savings['savings']:.2f}."
+        )
+        now = time.time()
+        conn = get_db_connection()
+        try:
+            conn.execute(
+                """
+                INSERT INTO insights(ts, type, message, potential_savings, created_ts)
+                VALUES(?,?,?,?,?)
+                """,
+                (now, "tou_optimization", msg, savings["savings"], now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        send_notification("TOU optimization", msg, "info")
+
+
+def poll_sensor_loop():
+    global last_agg_ts, agg_buffer, enhanced_detector
+
+    while True:
+        start_loop = time.time()
+        ts_now = start_loop
+        power_w = read_neurio_power_w()
+
+        with state_lock:
+            recent_samples.append((ts_now, power_w))
+
+        # Enhanced detection
+        if enhanced_detector is not None:
+            try:
+                events = enhanced_detector.process_sample(ts_now, power_w)
+                for ev in events:
+                    if ev["type"] == "stopped":
+                        store_detector_event(ev)
+            except Exception:
+                # do not crash loop
+                pass
+
+        # Aggregation buffer
+        if power_w is not None:
+            agg_buffer.append((ts_now, power_w))
+
+        if last_agg_ts is None:
+            last_agg_ts = ts_now
+
+        if ts_now - last_agg_ts >= AGGREGATE_INTERVAL_SECONDS and agg_buffer:
+            powers = [p for _, p in agg_buffer if p is not None]
+            if powers:
+                avg_power = sum(powers) / len(powers)
+                mid_index = len(agg_buffer) // 2
+                agg_ts = agg_buffer[mid_index][0]
+                store_aggregate(agg_ts, avg_power)
+            agg_buffer = []
+            last_agg_ts = ts_now
+
+        elapsed = time.time() - start_loop
+        sleep_for = max(0.0, POLL_INTERVAL_SECONDS - elapsed)
+        time.sleep(sleep_for)
+
+
+# ----------------- API routes -----------------
 
 @app.route("/api/live")
 def api_live():
@@ -1366,261 +1376,108 @@ def api_live():
         if recent_samples:
             ts, power_w = recent_samples[-1]
         else:
-            ts = int(time.time())
-            power_w = None
+            ts, power_w = time.time(), None
 
-    error = None
-    if power_w is None:
-        error = "No recent sample"
-        power_w_val = 0.0
-    else:
-        power_w_val = float(power_w)
-
-    dt_local = datetime.fromtimestamp(ts)
-    season, tou_period, rate_cents = classify_tou(dt_local)
-    rate_per_kwh = rate_cents / 100.0
-    cost_per_hour = (power_w_val / 1000.0) * rate_per_kwh
+    # Today's totals
+    today = date.today()
+    day_start_ts = datetime(today.year, today.month, today.day).timestamp()
+    conn = get_db_connection()
+    try:
+        cur = conn.execute(
+            "SELECT SUM(energy_kwh) as kwh, SUM(cost) as cost FROM samples WHERE ts>=?",
+            (day_start_ts,),
+        )
+        row = cur.fetchone()
+        kwh = row["kwh"] or 0.0
+        cost = row["cost"] or 0.0
+    finally:
+        conn.close()
 
     return jsonify(
         {
-            "error": error,
-            "power_w": power_w_val,
-            "rate_cents": rate_cents,
-            "rate_per_kwh": rate_per_kwh,
-            "season": season,
-            "tou_period": tou_period,
-            "ts": float(ts),
-            "cost_per_hour": cost_per_hour,
+            "ts": ts,
+            "ts_str": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
+            "power_w": power_w if power_w is not None else 0.0,
+            "today_kwh": round(kwh, 3),
+            "today_cost": round(cost, 2),
+            "error": None if power_w is not None else "No recent sample",
         }
     )
 
 
-@app.route("/api/history")
-def api_history():
+@app.route("/api/day")
+def api_day():
     day_str = request.args.get("day")
-    dt_day, start_ts, end_ts = get_day_bounds(day_str)
+    if day_str:
+        dt_day = datetime.strptime(day_str, "%Y-%m-%d").date()
+    else:
+        dt_day = date.today()
+
+    start_dt = datetime(dt_day.year, dt_day.month, dt_day.day)
+    end_dt = start_dt + timedelta(days=1)
+    start_ts = start_dt.timestamp()
+    end_ts = end_dt.timestamp()
 
     conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT ts, power_w, energy_kwh, cost, season, tou_period, rate_cents
-        FROM samples
-        WHERE ts >= ? AND ts < ?
-        ORDER BY ts
-        """,
-        (start_ts, end_ts),
-    )
-    rows = cur.fetchall()
-    conn.close()
-
-    samples = []
-    totals_energy = 0.0
-    totals_cost = 0.0
-
-    per_period_map = {}
-    hourly_map = {}
-
-    for r in rows:
-        ts = int(r["ts"])
-        power_w = float(r["power_w"])
-        energy_kwh = float(r["energy_kwh"])
-        cost = float(r["cost"])
-        season = r["season"]
-        tou_period = r["tou_period"]
-        rate_cents = float(r["rate_cents"])
-
-        totals_energy += energy_kwh
-        totals_cost += cost
-
-        samples.append(
-            {
-                "power_w": power_w,
-                "ts": float(ts),
-                "ts_str": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
-            }
-        )
-
-        key = (season, tou_period, rate_cents)
-        if key not in per_period_map:
-            per_period_map[key] = {"energy_kwh": 0.0, "cost": 0.0}
-        per_period_map[key]["energy_kwh"] += energy_kwh
-        per_period_map[key]["cost"] += cost
-
-        hour_dt = datetime.fromtimestamp(ts).replace(
-            minute=0, second=0, microsecond=0
-        )
-        hour_ts = int(hour_dt.timestamp())
-        if hour_ts not in hourly_map:
-            hourly_map[hour_ts] = {
-                "sum_power_w": 0.0,
-                "count": 0,
-                "energy_kwh": 0.0,
-                "cost": 0.0,
-            }
-        hourly_map[hour_ts]["sum_power_w"] += power_w
-        hourly_map[hour_ts]["count"] += 1
-        hourly_map[hour_ts]["energy_kwh"] += energy_kwh
-        hourly_map[hour_ts]["cost"] += cost
-
-    per_period = []
-    for (season, tou_period, rate_cents), agg in per_period_map.items():
-        per_period.append(
-            {
-                "season": season,
-                "tou_period": tou_period,
-                "rate_cents": rate_cents,
-                "energy_kwh": agg["energy_kwh"],
-                "cost": agg["cost"],
-            }
-        )
-
-    hourly = []
-    for hour_ts, agg in sorted(hourly_map.items()):
-        count = agg["count"]
-        avg_power_w = agg["sum_power_w"] / count if count > 0 else 0.0
-        hourly.append(
-            {
-                "ts_hour": float(hour_ts),
-                "ts_hour_str": datetime.fromtimestamp(hour_ts).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
-                "avg_power_w": avg_power_w,
-                "energy_kwh": agg["energy_kwh"],
-                "cost": agg["cost"],
-            }
-        )
-
-    totals = {"energy_kwh": totals_energy, "cost": totals_cost}
-    daily_summary = compute_daily_summary(rows, start_ts)
-
-    budget = DAILY_BUDGET
-    budget_hit_ts = None
-    if budget and budget > 0:
-        running = 0.0
-        for r in rows:
-            running += float(r["cost"])
-            if running >= budget:
-                budget_hit_ts = int(r["ts"])
-                break
-
-    if budget_hit_ts is not None:
-        budget_hit_str = datetime.fromtimestamp(budget_hit_ts).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-    else:
-        budget_hit_str = None
-
-    budget_info = {
-        "budget": float(budget),
-        "hit_ts": budget_hit_ts,
-        "hit_str": budget_hit_str,
-        "spent": totals_cost,
-        "remaining": max(0.0, budget - totals_cost),
-    }
-
-    return jsonify(
-        {
-            "hourly": hourly,
-            "per_period": per_period,
-            "samples": samples,
-            "totals": totals,
-            "daily_summary": daily_summary,
-            "budget_info": budget_info,
-        }
-    )
-
-
-@app.route("/api/monthly_overview")
-def api_monthly_overview():
-    now = datetime.now()
-    this_start = datetime(now.year, now.month, 1)
-    this_end = now
-
-    if now.month == 1:
-        last_start = datetime(now.year - 1, 12, 1)
-    else:
-        last_start = datetime(now.year, now.month - 1, 1)
-    last_end = this_start
-
-    this_kwh, this_cost = query_range_totals(this_start, this_end)
-    last_kwh, last_cost = query_range_totals(last_start, last_end)
-
-    delta_kwh = this_kwh - last_kwh
-    delta_cost = this_cost - last_cost
-
-    pct_kwh = (delta_kwh / last_kwh * 100.0) if last_kwh > 0 else None
-    pct_cost = (delta_cost / last_cost * 100.0) if last_cost > 0 else None
-
-    today = datetime.now().date()
-    yesterday = today - timedelta(days=1)
-    day_before = today - timedelta(days=2)
-
     try:
-        y_summary = get_daily_summary_for_date(yesterday)
-        y_always = y_summary.get("always_on_w", 0.0)
-    except Exception:
-        y_always = 0.0
+        cur = conn.execute(
+            """
+            SELECT ts, power_w, energy_kwh, cost
+            FROM samples
+            WHERE ts>=? AND ts<?
+            ORDER BY ts
+            """,
+            (start_ts, end_ts),
+        )
+        samples = [
+            {
+                "ts": row["ts"],
+                "ts_str": datetime.fromtimestamp(row["ts"]).strftime("%H:%M"),
+                "power_w": row["power_w"],
+                "energy_kwh": row["energy_kwh"],
+                "cost": row["cost"],
+            }
+            for row in cur
+        ]
+    finally:
+        conn.close()
 
+    return jsonify({"day": dt_day.isoformat(), "samples": samples})
+
+
+@app.route("/api/appliances")
+def api_appliances():
+    days = int(request.args.get("days", "7"))
+    since = time.time() - days * 24 * 3600
+
+    conn = get_db_connection()
     try:
-        p_summary = get_daily_summary_for_date(day_before)
-        p_always = p_summary.get("always_on_w", 0.0)
-    except Exception:
-        p_always = 0.0
+        cur = conn.execute(
+            """
+            SELECT appliance_name,
+                   SUM(energy_kwh) as total_kwh,
+                   SUM(cost) as total_cost,
+                   COUNT(*) as runs
+            FROM appliance_events
+            WHERE start_ts>=?
+            GROUP BY appliance_name
+            ORDER BY total_cost DESC
+            """,
+            (since,),
+        )
+        rows = [
+            {
+                "name": r["appliance_name"],
+                "kwh": round(r["total_kwh"] or 0.0, 2),
+                "cost": round(r["total_cost"] or 0.0, 2),
+                "runs": r["runs"],
+            }
+            for r in cur
+        ]
+    finally:
+        conn.close()
 
-    delta_always = y_always - p_always
-
-    return jsonify(
-        {
-            "this_month": {"kwh": this_kwh, "cost": this_cost},
-            "last_month": {"kwh": last_kwh, "cost": last_cost},
-            "delta_kwh": delta_kwh,
-            "delta_cost": delta_cost,
-            "pct_kwh": pct_kwh,
-            "pct_cost": pct_cost,
-            "always_on": {
-                "yesterday_w": y_always,
-                "prev_w": p_always,
-                "delta_w": delta_always,
-            },
-        }
-    )
-
-
-@app.route("/api/week_overview")
-def api_week_overview():
-    now = datetime.now()
-    today = now.date()
-    weekday = today.weekday()
-    this_start_date = today - timedelta(days=weekday)
-    this_start = datetime(
-        this_start_date.year, this_start_date.month, this_start_date.day
-    )
-    this_end = now
-
-    last_start = this_start - timedelta(days=7)
-    last_end = this_start
-
-    this_kwh, this_cost = query_range_totals(this_start, this_end)
-    last_kwh, last_cost = query_range_totals(last_start, last_end)
-
-    delta_kwh = this_kwh - last_kwh
-    delta_cost = this_cost - last_cost
-
-    pct_kwh = (delta_kwh / last_kwh * 100.0) if last_kwh > 0 else None
-    pct_cost = (delta_cost / last_cost * 100.0) if last_cost > 0 else None
-
-    return jsonify(
-        {
-            "this_week": {"kwh": this_kwh, "cost": this_cost},
-            "last_week": {"kwh": last_kwh, "cost": last_cost},
-            "delta_kwh": delta_kwh,
-            "delta_cost": delta_cost,
-            "pct_kwh": pct_kwh,
-            "pct_cost": pct_cost,
-            "week_start_str": this_start.strftime("%Y-%m-%d"),
-        }
-    )
+    return jsonify({"since_days": days, "appliances": rows})
 
 
 @app.route("/api/prediction")
@@ -1634,53 +1491,43 @@ def api_prediction():
 
 @app.route("/api/insights")
 def api_insights():
-    conn = get_conn()
+    conn = get_db_connection()
     try:
         conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            "SELECT message, potential_savings FROM insights WHERE dismissed=0 "
+            "ORDER BY ts DESC LIMIT 10"
+        )
+        insights = [
+            {
+                "message": r["message"],
+                "potential_savings": r["potential_savings"],
+            }
+            for r in cur
+        ]
 
         cur = conn.execute(
-            "SELECT * FROM insights WHERE dismissed=0 ORDER BY ts DESC LIMIT 10"
+            "SELECT type, message, severity FROM anomaly_alerts "
+            "WHERE acknowledged=0 ORDER BY ts DESC LIMIT 5"
         )
-        insights_list = []
-        for row in cur:
-            insights_list.append(
-                {
-                    "message": row["message"],
-                    "potential_savings": row["potential_savings"],
-                }
-            )
+        anomalies = [
+            {
+                "type": r["type"],
+                "message": r["message"],
+                "severity": r["severity"],
+            }
+            for r in cur
+        ]
 
-        cur = conn.execute(
-            "SELECT * FROM anomaly_alerts WHERE acknowledged=0 "
-            "ORDER BY ts DESC LIMIT 5"
-        )
-        anomalies = []
-        for row in cur:
-            anomalies.append(
-                {
-                    "type": row["type"],
-                    "message": row["message"],
-                    "severity": row["severity"],
-                }
-            )
-
-        return jsonify({"insights": insights_list, "anomalies": anomalies})
+        return jsonify({"insights": insights, "anomalies": anomalies})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
         conn.close()
 
-@app.route("/api/appliance_costs")
-def api_appliance_costs():
-    days = request.args.get("days", default=30, type=int)
-    try:
-        items = get_appliance_costs_breakdown(days)
-        return jsonify({"days": days, "appliances": items})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
-@app.route("/api/advanced_stats")
-def api_advanced_stats():
+@app.route("/api/goals")
+def api_goals():
     goal = track_energy_goal()
     footprint = calculate_carbon_footprint()
     forecast = forecast_tomorrow()
@@ -1690,249 +1537,26 @@ def api_advanced_stats():
         {
             "goal": goal,
             "footprint": footprint,
-            "forecast": forecast,
-            "vacation": vacation,
-            "peak": peak,
-        }
-    )
-
-@app.route("/api/discovery", methods=["GET", "POST"])
-def api_discovery():
-    if request.method == "POST":
-        data = request.get_json(silent=True) or {}
-        action = data.get("action")
-        now_ts = time.time()
-        if action == "start":
-            discovery_state["active"] = True
-            discovery_state["start_ts"] = now_ts
-            discovery_state["discovered"] = []
-            return jsonify(
-                {
-                    "status": "started",
-                    "active": True,
-                    "start_ts": now_ts,
-                }
-            )
-        elif action == "stop":
-            discovery_state["active"] = False
-            suggestions = run_auto_discovery_analysis()
-            return jsonify(
-                {
-                    "status": "stopped",
-                    "active": False,
-                    "suggestions": suggestions,
-                }
-            )
-        else:
-            return jsonify({"error": "Unknown action"}), 400
-
-    suggestions = run_auto_discovery_analysis()
-    return jsonify(
-        {
-            "active": discovery_state["active"],
-            "start_ts": discovery_state["start_ts"],
-            "suggestions": suggestions,
-        }
-    )
-
-@app.route("/api/export_csv")
-def api_export_csv():
-    day_str = request.args.get("day")
-    dt_day, start_ts, end_ts = get_day_bounds(day_str)
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT ts, power_w, energy_kwh, cost, season, tou_period, rate_cents
-        FROM samples
-        WHERE ts >= ? AND ts < ?
-        ORDER BY ts
-        """,
-        (start_ts, end_ts),
-    )
-    rows = cur.fetchall()
-    conn.close()
-
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(
-        [
-            "timestamp",
-            "local_time",
-            "power_w",
-            "energy_kwh",
-            "cost",
-            "season",
-            "tou_period",
-            "rate_cents",
-        ]
-    )
-
-    for r in rows:
-        ts = int(r["ts"])
-        writer.writerow(
-            [
-                ts,
-                datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
-                float(r["power_w"]),
-                float(r["energy_kwh"]),
-                float(r["cost"]),
-                r["season"],
-                r["tou_period"],
-                float(r["rate_cents"]),
-            ]
-        )
-
-    csv_data = output.getvalue()
-    output.close()
-
-    filename = f"power_{dt_day.isoformat()}.csv"
-    resp = Response(csv_data, mimetype="text/csv")
-    resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
-    return resp
-
-
-@app.route("/api/rates", methods=["GET", "POST"])
-def api_rates():
-    if request.method == "GET":
-        nested = {"winter": {}, "summer": {}}
-        for season in ("winter", "summer"):
-            for period in ("off_peak", "mid_peak", "on_peak"):
-                key = (season, period)
-                cents = RATES.get(key, DEFAULT_RATES[season][period])
-                nested[season][period] = cents / 100.0
-        return jsonify({"rates": nested})
-
-    data = request.get_json(silent=True) or {}
-    rates = data.get("rates", {})
-
-    for season in ("winter", "summer"):
-        s_obj = rates.get(season, {})
-        for period in ("off_peak", "mid_peak", "on_peak"):
-            if period in s_obj:
-                try:
-                    dollars = float(s_obj[period])
-                except (TypeError, ValueError):
-                    continue
-                cents = dollars * 100.0
-                update_rate(season, period, cents)
-
-    load_rates()
-    return jsonify({"status": "ok"})
-
-
-@app.route("/api/settings", methods=["GET", "POST"])
-def api_settings():
-    if request.method == "GET":
-        return jsonify(
-            {
-                "daily_budget": DAILY_BUDGET,
-            }
-        )
-
-    data = request.get_json(silent=True) or {}
-    if "daily_budget" in data:
-        try:
-            val = float(data["daily_budget"])
-        except (TypeError, ValueError):
-            return jsonify({"error": "invalid daily_budget"}), 400
-        set_setting("daily_budget", str(val))
-        load_settings()
-
-    return jsonify(
-        {
-            "status": "ok",
-            "daily_budget": DAILY_BUDGET,
+            "tomorrow": forecast,
+            "vacation_mode": vacation,
+            "peak_warning": peak,
         }
     )
 
 
-@app.route("/api/appliances", methods=["GET"])
-def api_appliances():
-    now_ts = int(time.time())
-    cutoff = now_ts - 86400
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT appliance_name, start_ts, end_ts, avg_w, energy_kwh, cost, confidence
-        FROM appliance_events
-        WHERE start_ts >= ?
-        ORDER BY start_ts DESC
-        LIMIT 50
-        """,
-        (cutoff,),
-    )
-    rows = cur.fetchall()
-    conn.close()
-
-    with state_lock:
-        training = {
-            "active": training_active,
-            "name": training_name,
-        }
-        signatures = list(appliance_signatures_cache)
-
-    events = []
-    for r in rows:
-        start_ts = int(r["start_ts"])
-        end_ts = int(r["end_ts"])
-        events.append(
-            {
-                "appliance_name": r["appliance_name"],
-                "start_ts": start_ts,
-                "end_ts": end_ts,
-                "start_str": datetime.fromtimestamp(start_ts).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
-                "end_str": datetime.fromtimestamp(end_ts).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
-                "avg_w": float(r["avg_w"]),
-                "energy_kwh": float(r["energy_kwh"]),
-                "cost": float(r["cost"]),
-                "confidence": float(r["confidence"]),
-            }
-        )
-
-    return jsonify(
-        {
-            "training": training,
-            "signatures": signatures,
-            "events": events,
-        }
-    )
+@app.route("/api/appliance_costs")
+def api_appliance_costs():
+    days = int(request.args.get("days", "30"))
+    breakdown = get_appliance_costs_breakdown(days=days)
+    return jsonify({"days": days, "appliances": breakdown})
 
 
-@app.route("/api/appliance/train", methods=["POST"])
-def api_appliance_train():
-    data = request.get_json(silent=True) or {}
-    action = data.get("action")
+@app.route("/api/voice_summary")
+def api_voice_summary():
+    return jsonify({"summary": get_voice_summary()})
 
-    if action == "start":
-        name = (data.get("name") or "").strip()
-        if not name:
-            return jsonify({"error": "Name is required"}), 400
-        with state_lock:
-            global training_active, training_name, training_samples
-            training_active = True
-            training_name = name
-            training_samples = []
-        return jsonify({"status": "ok", "mode": "training", "name": name})
 
-    if action == "stop":
-        with state_lock:
-            result = finalize_appliance_training_locked()
-        if "error" in result:
-            return jsonify(result), 400
-        return jsonify(result)
-
-    return jsonify({"error": "Unknown action"}), 400
-
-# ------------- Dashboard HTML -------------
-
+# ----------------- HTML dashboard -----------------
 DASHBOARD_HTML = r"""
 <!DOCTYPE html>
 <html>
@@ -2147,7 +1771,7 @@ DASHBOARD_HTML = r"""
         </div>
         <div class="card-row">
           <span>Budget</span>
-          <span id="dayBudget">–</span>
+          <span id="dayBudget">â€“</span>
         </div>
         <div class="card-row">
           <span>Hit time</span>
@@ -2645,7 +2269,7 @@ DASHBOARD_HTML = r"""
               dayBudgetHitEl.textContent = 'Not reached';
             }
           } else {
-            dayBudgetEl.textContent = '–';
+            dayBudgetEl.textContent = 'â€“';
             dayBudgetHitEl.textContent = 'Not set';
           }
         })
@@ -2674,7 +2298,7 @@ DASHBOARD_HTML = r"""
 
           const ao = data.always_on || {};
           const deltaW = ao.delta_w || 0;
-          const text = (deltaW >= 0 ? '+' : '−') + Math.abs(deltaW).toFixed(0) + ' W vs prior night';
+          const text = (deltaW >= 0 ? '+' : 'âˆ’') + Math.abs(deltaW).toFixed(0) + ' W vs prior night';
           alwaysOnChangeEl.textContent = text;
         })
         .catch(err => {
@@ -2837,8 +2461,8 @@ DASHBOARD_HTML = r"""
             signatures.forEach(sig => {
               const li = document.createElement('li');
               li.textContent =
-                sig.name + ' · Δavg ' +
-                (sig.avg_w || 0).toFixed(0) + ' W · Δpeak ' +
+                sig.name + ' Â· Î”avg ' +
+                (sig.avg_w || 0).toFixed(0) + ' W Â· Î”peak ' +
                 (sig.peak_w || 0).toFixed(0) + ' W';
               applianceListEl.appendChild(li);
             });
@@ -2852,8 +2476,8 @@ DASHBOARD_HTML = r"""
               const kwh = ev.energy_kwh || 0;
               const cost = ev.cost || 0;
               html += '<div style="margin-bottom:6px;">' +
-                '<strong>' + ev.appliance_name + '</strong> · ' +
-                ev.start_str + ' → ' + ev.end_str +
+                '<strong>' + ev.appliance_name + '</strong> Â· ' +
+                ev.start_str + ' â†’ ' + ev.end_str +
                 '<br>' +
                 kwh.toFixed(2) + ' kWh, $' + cost.toFixed(2) +
                 '</div>';
@@ -3043,10 +2667,10 @@ DASHBOARD_HTML = r"""
             suggestions.forEach(s => {
               const li = document.createElement('li');
               li.textContent =
-                s.description + ' · ' +
-                s.occurrences + ' runs · avg $' +
+                s.description + ' Â· ' +
+                s.occurrences + ' runs Â· avg $' +
                 s.avg_cost_per_use.toFixed(2) +
-                ' · guess: ' + s.suggested_name;
+                ' Â· guess: ' + s.suggested_name;
               discoveryListEl.appendChild(li);
             });
           }
@@ -3121,19 +2745,17 @@ DASHBOARD_HTML = r"""
 </html>
 """
 
-# ------------- Main -------------
+
+# ----------------- Main -----------------
 
 def main():
-    global enhanced_detector, enhanced_trainer
-
+    global enhanced_detector
     init_db()
-
-    # Create enhanced detection + training objects
     enhanced_detector = ApplianceDetector(DB_PATH)
-    enhanced_trainer = ApplianceTrainer(DB_PATH)
 
     t = threading.Thread(target=poll_sensor_loop, daemon=True)
     t.start()
+
     app.run(host="0.0.0.0", port=8000)
 
 
